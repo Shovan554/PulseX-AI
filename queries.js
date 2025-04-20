@@ -63,6 +63,39 @@ const queries = {
       GROUP BY day
       ORDER BY day;
     `
+  },
+  
+  activeEnergy: {
+    weeklyStats: `
+      SELECT
+        hr.timestamp::date    AS day,
+        SUM(value)            AS active_energy_kcal
+      FROM health_realtime hr
+      WHERE metric_name = 'active_energy'
+        AND hr.timestamp::date >= CURRENT_DATE - INTERVAL '6 days'
+      GROUP BY day
+      ORDER BY day ASC;
+    `
+  },
+  
+  exerciseAndHeartRate: {
+    weeklyStats: `
+      SELECT
+        timestamp::date AS day,
+        SUM(value) FILTER (
+          WHERE metric_name = 'apple_exercise_time'
+            AND timestamp::date BETWEEN CURRENT_DATE - INTERVAL '6 days' AND CURRENT_DATE
+        ) AS daily_exercise_minutes,
+        AVG(value) FILTER (
+          WHERE metric_name = 'resting_heart_rate'
+            AND timestamp::date BETWEEN CURRENT_DATE - INTERVAL '6 days' AND CURRENT_DATE
+        ) AS daily_avg_resting_hr
+      FROM health_aggregated
+      WHERE metric_name IN ('apple_exercise_time','resting_heart_rate')
+        AND timestamp::date BETWEEN CURRENT_DATE - INTERVAL '6 days' AND CURRENT_DATE
+      GROUP BY day
+      ORDER BY day;
+    `
   }
 };
 

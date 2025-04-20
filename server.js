@@ -145,27 +145,37 @@ async function processSleepAnalysis(client, entry) {
     rawData: JSON.stringify(entry)
   };
 
-  const query = `
-    INSERT INTO sleep_analysis 
-      (record_date, sleep_start, sleep_end, in_bed_start, in_bed_end, in_bed,
-       asleep, deep, core, rem, awake, source, raw_data)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-    ON CONFLICT (record_date) 
-    DO UPDATE SET 
-      sleep_start = EXCLUDED.sleep_start,
-      sleep_end = EXCLUDED.sleep_end,
-      in_bed_start = EXCLUDED.in_bed_start,
-      in_bed_end = EXCLUDED.in_bed_end,
-      in_bed = EXCLUDED.in_bed,
-      asleep = EXCLUDED.asleep,
-      deep = EXCLUDED.deep,
-      core = EXCLUDED.core,
-      rem = EXCLUDED.rem,
-      awake = EXCLUDED.awake,
-      source = EXCLUDED.source,
-      raw_data = EXCLUDED.raw_data`;
+  // First try to update
+  const updateQuery = `
+    UPDATE sleep_analysis 
+    SET 
+      sleep_start = $2,
+      sleep_end = $3,
+      in_bed_start = $4,
+      in_bed_end = $5,
+      in_bed = $6,
+      asleep = $7,
+      deep = $8,
+      core = $9,
+      rem = $10,
+      awake = $11,
+      source = $12,
+      raw_data = $13
+    WHERE record_date = $1
+    RETURNING *`;
 
-  await client.query(query, Object.values(sleepData));
+  let result = await client.query(updateQuery, Object.values(sleepData));
+  
+  // If no row was updated, insert a new one
+  if (result.rowCount === 0) {
+    const insertQuery = `
+      INSERT INTO sleep_analysis 
+        (record_date, sleep_start, sleep_end, in_bed_start, in_bed_end, in_bed,
+         asleep, deep, core, rem, awake, source, raw_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`;
+
+    await client.query(insertQuery, Object.values(sleepData));
+  }
 }
 
 async function processStandardMetric(client, name, units, entry) {
@@ -204,8 +214,8 @@ app.get('/api/heart-rate/current', async (req, res) => {
   try {
     const query = `
       SELECT
-        value        AS latest_heart_rate,
-        timestamp    AS reading_time
+        ROUND(value)::integer  AS latest_heart_rate,
+        timestamp             AS reading_time
       FROM health_realtime
       WHERE metric_name = 'heart_rate'
       ORDER BY timestamp DESC
@@ -349,6 +359,217 @@ app.get('/api/daylight/weekly', async (req, res) => {
   } catch (err) {
     console.error('Error fetching daylight data:', err);
     res.status(500).json({ error: 'Failed to fetch daylight data' });
+  }
+});
+
+// Sleep average endpoint
+app.get('/api/sleep/weekly-average', async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        ROUND(
+          AVG(
+            EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0
+            ::numeric
+          )
+        , 2) AS average
+      FROM sleep_analysis
+      WHERE record_date >= CURRENT_DATE - INTERVAL '6 days'`;
+    
+    const result = await pool.query(query);
+    res.json({ average: result.rows[0].average || null });
+  } catch (err) {
+    console.error('Error fetching sleep average:', err);
+    res.status(500).json({ error: 'Failed to fetch sleep average' });
+  }
+});
+
+app.get('/api/sleep/latest', async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        record_date,
+        ROUND(
+          EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0
+          ::numeric
+        , 2) AS total_sleep_hours,
+        ROUND(deep   ::numeric, 2) AS deep_sleep_hours,
+        ROUND(core   ::numeric, 2) AS core_sleep_hours,
+        ROUND(rem    ::numeric, 2) AS rem_sleep_hours
+      FROM sleep_analysis
+      ORDER BY record_date DESC
+      LIMIT 1`;
+    
+    const result = await pool.query(query);
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error('Error fetching latest sleep data:', err);
+    res.status(500).json({ error: 'Failed to fetch latest sleep data' });
+  }
+});
+
+app.get('/api/sleep/weekly-timeline', async (req, res) => {
+  try {
+    const query = `
+      WITH date_range AS (
+        SELECT generate_series(
+          CURRENT_DATE - INTERVAL '6 days',
+          CURRENT_DATE,
+          '1 day'::interval
+        )::date AS date
+      )
+      SELECT
+        dr.date as record_date,
+        COALESCE(
+          ROUND(
+            EXTRACT(EPOCH FROM (sa.sleep_end - sa.sleep_start)) / 3600.0
+            ::numeric
+          , 2
+        ), 0) AS total_sleep_hours,
+        COALESCE(ROUND(sa.deep::numeric, 2), 0) AS deep_sleep_hours,
+        COALESCE(ROUND(sa.core::numeric, 2), 0) AS core_sleep_hours,
+        COALESCE(ROUND(sa.rem::numeric, 2), 0) AS rem_sleep_hours,
+        COALESCE(ROUND(sa.awake::numeric, 2), 0) AS awake_hours
+      FROM date_range dr
+      LEFT JOIN sleep_analysis sa ON dr.date = sa.record_date
+      ORDER BY dr.date ASC;
+    `;
+    
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching sleep timeline:', err);
+    res.status(500).json({ error: 'Failed to fetch sleep timeline' });
+  }
+});
+
+// Active Energy endpoint
+app.get('/api/active-energy/weekly', async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        hr.timestamp::date    AS day,
+        SUM(value)            AS active_energy_kcal
+      FROM health_realtime hr
+      WHERE metric_name = 'active_energy'
+        AND hr.timestamp::date >= CURRENT_DATE - INTERVAL '6 days'
+      GROUP BY day
+      ORDER BY day DESC;
+    `;
+    
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching active energy data:', err);
+    res.status(500).json({ error: 'Failed to fetch active energy data' });
+  }
+});
+
+// Exercise and Resting Heart Rate endpoint
+app.get('/api/exercise-heart-rate/weekly', async (req, res) => {
+  try {
+    const query = queries.exerciseAndHeartRate.weeklyStats;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching exercise and heart rate data:', err);
+    res.status(500).json({ error: 'Failed to fetch exercise and heart rate data' });
+  }
+});
+
+// Get current goals
+app.get('/api/goals', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT sleep_goal_hours, active_burn_goal_kcal, step_goal_count FROM goals ORDER BY created_at DESC LIMIT 1'
+    );
+    res.json(result.rows[0] || {
+      sleep_goal_hours: 8,
+      active_burn_goal_kcal: 500,
+      step_goal_count: 10000
+    });
+  } catch (err) {
+    console.error('Error fetching goals:', err);
+    res.status(500).json({ error: 'Failed to fetch goals' });
+  } finally {
+    client.release();
+  }
+});
+
+// Update goals
+app.post('/api/goals', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { sleep_goal_hours, active_burn_goal_kcal, step_goal_count } = req.body;
+    
+    await client.query(
+      `INSERT INTO goals (sleep_goal_hours, active_burn_goal_kcal, step_goal_count)
+       VALUES ($1, $2, $3)`,
+      [sleep_goal_hours, active_burn_goal_kcal, step_goal_count]
+    );
+    
+    res.json({ message: 'Goals updated successfully' });
+  } catch (err) {
+    console.error('Error updating goals:', err);
+    res.status(500).json({ error: 'Failed to update goals' });
+  } finally {
+    client.release();
+  }
+});
+
+// Get latest BMI data
+app.get('/api/bmi/latest', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT weight_kg, height_cm, sex, age, bmi_value FROM bmi_index ORDER BY created_at DESC LIMIT 1'
+    );
+    res.json(result.rows[0] || {
+      weight_kg: '',
+      height_cm: '',
+      sex: '',
+      age: '',
+      bmi_value: null
+    });
+  } catch (err) {
+    console.error('Error fetching BMI data:', err);
+    res.status(500).json({ error: 'Failed to fetch BMI data' });
+  } finally {
+    client.release();
+  }
+});
+
+// Update BMI data
+app.post('/api/bmi', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { weight_kg, height_cm, sex, age } = req.body;
+    
+    await client.query(
+      `INSERT INTO bmi_index (weight_kg, height_cm, sex, age)
+       VALUES ($1, $2, $3, $4)`,
+      [weight_kg, height_cm, sex, age]
+    );
+    
+    res.json({ message: 'BMI data updated successfully' });
+  } catch (err) {
+    console.error('Error updating BMI data:', err);
+    res.status(500).json({ error: 'Failed to update BMI data' });
+  } finally {
+    client.release();
+  }
+});
+
+// Headphone Audio Exposure endpoint
+app.get('/api/headphone-exposure/latest', async (req, res) => {
+  try {
+    const query = queries.headphoneExposure.latest;
+    const result = await pool.query(query);
+    res.json(result.rows[0] || { value: null, timestamp: null });
+  } catch (err) {
+    console.error('Error fetching headphone exposure data:', err);
+    res.status(500).json({ error: 'Failed to fetch headphone exposure data' });
   }
 });
 

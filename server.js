@@ -573,6 +573,215 @@ app.get('/api/headphone-exposure/latest', async (req, res) => {
   }
 });
 
+// Weekly trends endpoint
+app.get('/api/trends/weekly', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const weeklyQuery = `
+      WITH 
+      -- Sleep data by week
+      sleep_week AS (
+        SELECT
+          date_trunc('week', sleep_start::date)::date AS week_start,
+          SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0 AS total_sleep_hrs
+        FROM sleep_analysis
+        GROUP BY 1
+      ),
+      
+      -- Metrics by week
+      metrics_week AS (
+        SELECT
+          date_trunc('week', timestamp::date)::date AS week_start,
+          SUM(CASE WHEN metric_name = 'active_energy' THEN value ELSE 0 END) AS total_active_kcal,
+          SUM(CASE WHEN metric_name = 'step_count' THEN value ELSE 0 END) AS total_steps,
+          AVG(CASE WHEN metric_name = 'heart_rate' THEN value ELSE NULL END) AS avg_heart_rate
+        FROM health_realtime
+        GROUP BY 1
+      ),
+      
+      -- Join current and previous week data
+      week_pair AS (
+        SELECT
+          s1.total_sleep_hrs AS sleep_previous,
+          s2.total_sleep_hrs AS sleep_current,
+          m1.total_active_kcal AS energy_previous,
+          m2.total_active_kcal AS energy_current,
+          ROUND(m1.avg_heart_rate::numeric, 1) AS heart_rate_previous,
+          ROUND(m2.avg_heart_rate::numeric, 1) AS heart_rate_current,
+          m1.total_steps AS steps_previous,
+          m2.total_steps AS steps_current
+        FROM sleep_week s1
+          JOIN sleep_week s2 ON s2.week_start = s1.week_start + INTERVAL '1 week'
+          JOIN metrics_week m1 ON m1.week_start = s1.week_start
+          JOIN metrics_week m2 ON m2.week_start = s2.week_start
+        WHERE s1.week_start = date_trunc('week', CURRENT_DATE - INTERVAL '2 week')
+      )
+      
+      -- Calculate final results with percentage changes
+      SELECT json_build_object(
+        'sleep_current', ROUND(sleep_current::numeric, 2),
+        'sleep_previous', ROUND(sleep_previous::numeric, 2),
+        'sleep_pct_change', ROUND(((sleep_current - sleep_previous) / NULLIF(sleep_previous, 0) * 100)::numeric, 2),
+        
+        'heart_rate_current', heart_rate_current,
+        'heart_rate_previous', heart_rate_previous,
+        'heart_rate_pct_change', ROUND(((heart_rate_current - heart_rate_previous) / NULLIF(heart_rate_previous, 0) * 100)::numeric, 2),
+        
+        'steps_current', ROUND(steps_current::numeric, 0),
+        'steps_previous', ROUND(steps_previous::numeric, 0),
+        'steps_pct_change', ROUND(((steps_current - steps_previous) / NULLIF(steps_previous, 0) * 100)::numeric, 2),
+        
+        'energy_current', ROUND(energy_current::numeric, 0),
+        'energy_previous', ROUND(energy_previous::numeric, 0),
+        'energy_pct_change', ROUND(((energy_current - energy_previous) / NULLIF(energy_previous, 0) * 100)::numeric, 2)
+      ) as trends
+      FROM week_pair;
+    `;
+
+    const result = await client.query(weeklyQuery);
+    res.json(result.rows[0].trends);
+  } catch (err) {
+    console.error('Error fetching weekly trends:', err);
+    res.status(500).json({ error: 'Failed to fetch weekly trends' });
+  } finally {
+    client.release();
+  }
+});
+
+// Daily trends endpoint
+app.get('/api/trends/daily', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const dailyQuery = `
+      WITH 
+      -- Daily sleep metrics
+      sleep_metrics AS (
+        SELECT
+          COALESCE(
+            (SELECT SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0
+             FROM sleep_analysis
+             WHERE sleep_start::date = CURRENT_DATE),
+            0
+          ) as current_sleep,
+          COALESCE(
+            (SELECT SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0
+             FROM sleep_analysis
+             WHERE sleep_start::date = CURRENT_DATE - INTERVAL '1 day'),
+            0
+          ) as previous_sleep
+      ),
+      
+      -- Daily health metrics
+      daily_metrics AS (
+        SELECT 
+          metric_name,
+          -- For heart rate, use AVG instead of SUM
+          CASE 
+            WHEN metric_name = 'heart_rate' THEN
+              AVG(CASE WHEN timestamp::date = CURRENT_DATE THEN value ELSE NULL END)
+            ELSE
+              SUM(CASE WHEN timestamp::date = CURRENT_DATE THEN value ELSE 0 END)
+          END as current_value,
+          
+          CASE 
+            WHEN metric_name = 'heart_rate' THEN
+              AVG(CASE WHEN timestamp::date = CURRENT_DATE - INTERVAL '1 day' THEN value ELSE NULL END)
+            ELSE
+              SUM(CASE WHEN timestamp::date = CURRENT_DATE - INTERVAL '1 day' THEN value ELSE 0 END)
+          END as previous_value
+        FROM health_realtime
+        WHERE timestamp >= CURRENT_DATE - INTERVAL '1 day'
+          AND metric_name IN ('heart_rate', 'step_count', 'active_energy')
+        GROUP BY metric_name
+      )
+      
+      SELECT json_build_object(
+        'sleep_current', ROUND(s.current_sleep::numeric, 2),
+        'sleep_previous', ROUND(s.previous_sleep::numeric, 2),
+        'sleep_pct_change', ROUND(((s.current_sleep - s.previous_sleep) / NULLIF(s.previous_sleep, 0) * 100)::numeric, 2),
+        
+        'heart_rate_current', ROUND((SELECT current_value FROM daily_metrics WHERE metric_name = 'heart_rate')::numeric, 1),
+        'heart_rate_previous', ROUND((SELECT previous_value FROM daily_metrics WHERE metric_name = 'heart_rate')::numeric, 1),
+        'heart_rate_pct_change', ROUND(((
+          (SELECT current_value FROM daily_metrics WHERE metric_name = 'heart_rate') -
+          (SELECT previous_value FROM daily_metrics WHERE metric_name = 'heart_rate')
+        ) / NULLIF((SELECT previous_value FROM daily_metrics WHERE metric_name = 'heart_rate'), 0) * 100)::numeric, 2),
+        
+        'steps_current', ROUND((SELECT current_value FROM daily_metrics WHERE metric_name = 'step_count')::numeric, 0),
+        'steps_previous', ROUND((SELECT previous_value FROM daily_metrics WHERE metric_name = 'step_count')::numeric, 0),
+        'steps_pct_change', ROUND(((
+          (SELECT current_value FROM daily_metrics WHERE metric_name = 'step_count') -
+          (SELECT previous_value FROM daily_metrics WHERE metric_name = 'step_count')
+        ) / NULLIF((SELECT previous_value FROM daily_metrics WHERE metric_name = 'step_count'), 0) * 100)::numeric, 2),
+        
+        'energy_current', ROUND((SELECT current_value FROM daily_metrics WHERE metric_name = 'active_energy')::numeric, 0),
+        'energy_previous', ROUND((SELECT previous_value FROM daily_metrics WHERE metric_name = 'active_energy')::numeric, 0),
+        'energy_pct_change', ROUND(((
+          (SELECT current_value FROM daily_metrics WHERE metric_name = 'active_energy') -
+          (SELECT previous_value FROM daily_metrics WHERE metric_name = 'active_energy')
+        ) / NULLIF((SELECT previous_value FROM daily_metrics WHERE metric_name = 'active_energy'), 0) * 100)::numeric, 2)
+      ) as trends
+      FROM sleep_metrics s;
+    `;
+
+    const result = await client.query(dailyQuery);
+    res.json(result.rows[0].trends);
+  } catch (err) {
+    console.error('Error fetching daily trends:', err);
+    res.status(500).json({ error: 'Failed to fetch daily trends' });
+  } finally {
+    client.release();
+  }
+});
+
+// Health stats endpoint
+app.get('/api/health/stats', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const statsQuery = `
+      WITH heart_rate_stats AS (
+        SELECT 
+          ROUND(AVG(value)::numeric, 0) as recent_resting_hr
+        FROM health_aggregated 
+        WHERE metric_name = 'resting_heart_rate'
+          AND timestamp >= CURRENT_DATE - INTERVAL '24 hours'
+      ),
+      audio_exposure AS (
+        SELECT 
+          ROUND(AVG(value)::numeric, 0) as recent_audio_exposure
+        FROM health_aggregated 
+        WHERE metric_name = 'headphone_audio_exposure'
+          AND timestamp >= CURRENT_DATE - INTERVAL '24 hours'
+      )
+      SELECT json_build_object(
+        'recent_resting_hr', hr.recent_resting_hr,
+        'avg_resting_hr', (
+          SELECT ROUND(AVG(value)::numeric, 0)
+          FROM health_aggregated 
+          WHERE metric_name = 'resting_heart_rate'
+            AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+        ),
+        'recent_audio_exposure', ae.recent_audio_exposure,
+        'avg_audio_exposure', (
+          SELECT ROUND(AVG(value)::numeric, 0)
+          FROM health_aggregated 
+          WHERE metric_name = 'headphone_audio_exposure'
+            AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+        )
+      ) as stats
+      FROM heart_rate_stats hr, audio_exposure ae;
+    `;
+
+    const result = await client.query(statsQuery);
+    res.json(result.rows[0].stats);
+  } catch (err) {
+    console.error('Error fetching health stats:', err);
+    res.status(500).json({ error: 'Failed to fetch health stats' });
+  } finally {
+    client.release();
+  }
+});
+
 // Start the server
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);

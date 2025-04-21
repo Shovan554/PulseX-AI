@@ -1,16 +1,70 @@
+const { Parser } = require('json2csv');
 const express = require('express');
-const bodyParser = require('body-parser');
 const cors = require('cors');
-const pool = require('./db');
-const queries = require('./queries');
+const { Pool } = require('pg');
+const multer = require('multer');
+const nodemailer = require('nodemailer');
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 const PORT = 3001;
 
-// Middleware
+// Configure CORS
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json());
+
+// Database configuration - using your actual credentials from db.js
+const pool = new Pool({
+  user: 'shovan',
+  host: 'localhost',
+  database: 'health_data',
+  password: '', // Your password if any
+  port: 5432,
+});
+
+// Email configuration
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // true for 465, false for other ports
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD
+  },
+  tls: {
+    rejectUnauthorized: false
+  }
+});
+
+// Test email configuration on server start
+transporter.verify(function(error, success) {
+  if (error) {
+    console.log('Email configuration error:', error);
+  } else {
+    console.log('Email server is ready to send messages');
+  }
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Database connection error:', err);
+  } else {
+    console.log('Database connected successfully');
+  }
+});
+
+// Add error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something broke!' });
+});
+
+// Test endpoint
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'API is working' });
+});
 
 // Utility function to aggregate and insert data
 const aggregateAndInsertData = async (client, metricName, date) => {
@@ -934,6 +988,466 @@ app.get('/api/mental-health/recent', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch mental health history' });
   } finally {
     client.release();
+  }
+});
+
+// Generate Sleep Analysis Report
+app.get('/api/reports/sleep', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      WITH daily_metrics AS (
+        SELECT
+          record_date,
+          ROUND(EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0::numeric, 2) as total_hours,
+          ROUND(deep::numeric, 2) as deep_sleep,
+          ROUND(core::numeric, 2) as core_sleep,
+          ROUND(rem::numeric, 2) as rem_sleep,
+          ROUND(awake::numeric, 2) as time_awake,
+          ROUND((deep + core + rem)::numeric, 2) as total_sleep_time
+        FROM sleep_analysis
+        WHERE record_date >= CURRENT_DATE - INTERVAL '30 days'
+        ORDER BY record_date DESC
+      ),
+      sleep_stats AS (
+        SELECT
+          ROUND(AVG(total_hours)::numeric, 2) as avg_total_hours,
+          ROUND(AVG(deep_sleep)::numeric, 2) as avg_deep_sleep,
+          ROUND(AVG(rem_sleep)::numeric, 2) as avg_rem_sleep,
+          ROUND(AVG(core_sleep)::numeric, 2) as avg_core_sleep,
+          ROUND(AVG(time_awake)::numeric, 2) as avg_time_awake,
+          ROUND(AVG(total_sleep_time)::numeric, 2) as avg_total_sleep
+        FROM daily_metrics
+      )
+      SELECT 
+        json_build_object(
+          'daily_data', (SELECT json_agg(daily_metrics.*) FROM daily_metrics),
+          'statistics', (SELECT row_to_json(sleep_stats.*) FROM sleep_stats)
+        ) as report_data
+    `;
+
+    const result = await client.query(query);
+    res.json(result.rows[0].report_data);
+  } catch (err) {
+    console.error('Error generating sleep report:', err);
+    res.status(500).json({ error: 'Failed to generate sleep report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Generate Mood Patterns Report
+app.get('/api/reports/mood', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      WITH mood_data AS (
+        SELECT
+          DATE_TRUNC('day', timestamp) as date,
+          mood,
+          recent_heart_rate,
+          energy_burnt,
+          total_sleep,
+          notes
+        FROM mental_health
+        WHERE timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        ORDER BY date DESC
+      ),
+      mood_stats AS (
+        SELECT
+          COUNT(*) as total_entries,
+          ROUND(AVG(recent_heart_rate)::numeric, 0) as avg_heart_rate,
+          ROUND(AVG(energy_burnt)::numeric, 0) as avg_energy_burnt,
+          ROUND(AVG(total_sleep)::numeric, 1) as avg_sleep,
+          MODE() WITHIN GROUP (ORDER BY mood) as most_common_mood
+        FROM mood_data
+      ),
+      mood_distribution AS (
+        SELECT
+          mood,
+          COUNT(*) as count,
+          ROUND((COUNT(*)::float / (SELECT COUNT(*) FROM mood_data) * 100)::numeric, 1) as percentage
+        FROM mood_data
+        GROUP BY mood
+      )
+      SELECT json_build_object(
+        'daily_data', (SELECT json_agg(mood_data.*) FROM mood_data),
+        'statistics', (SELECT row_to_json(mood_stats.*) FROM mood_stats),
+        'distribution', (SELECT json_agg(mood_distribution.*) FROM mood_distribution)
+      ) as report_data
+    `;
+
+    const result = await client.query(query);
+    res.json(result.rows[0].report_data);
+  } catch (err) {
+    console.error('Error generating mood report:', err);
+    res.status(500).json({ error: 'Failed to generate mood report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Generate Activity Impact Report
+app.get('/api/reports/activity', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      WITH daily_activity AS (
+        SELECT
+          DATE_TRUNC('day', timestamp)::date as date,
+          SUM(CASE WHEN metric_name = 'step_count' THEN value ELSE 0 END) as total_steps,
+          SUM(CASE WHEN metric_name = 'active_energy' THEN value ELSE 0 END) as active_energy,
+          ROUND(AVG(CASE WHEN metric_name = 'heart_rate' THEN value ELSE null END)::numeric, 0) as avg_heart_rate
+        FROM health_realtime
+        WHERE timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY DATE_TRUNC('day', timestamp)::date
+        ORDER BY date DESC
+      ),
+      activity_stats AS (
+        SELECT
+          ROUND(AVG(total_steps)::numeric, 0) as avg_daily_steps,
+          ROUND(AVG(active_energy)::numeric, 0) as avg_active_energy,
+          ROUND(AVG(avg_heart_rate)::numeric, 0) as avg_heart_rate,
+          MAX(total_steps) as max_steps,
+          MAX(active_energy) as max_energy
+        FROM daily_activity
+      ),
+      mood_correlation AS (
+        SELECT
+          da.date,
+          da.total_steps,
+          da.active_energy,
+          mh.mood
+        FROM daily_activity da
+        LEFT JOIN mental_health mh ON DATE_TRUNC('day', mh.timestamp)::date = da.date
+      )
+      SELECT json_build_object(
+        'daily_data', (SELECT json_agg(daily_activity.*) FROM daily_activity),
+        'statistics', (SELECT row_to_json(activity_stats.*) FROM activity_stats),
+        'mood_correlation', (SELECT json_agg(mood_correlation.*) FROM mood_correlation)
+      ) as report_data
+    `;
+
+    const result = await client.query(query);
+    res.json(result.rows[0].report_data);
+  } catch (err) {
+    console.error('Error generating activity report:', err);
+    res.status(500).json({ error: 'Failed to generate activity report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Save Generated Report
+app.post('/api/reports', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { type, data } = req.body;
+    
+    const query = `
+      INSERT INTO generated_reports (
+        report_type,
+        report_data,
+        generated_at
+      ) VALUES ($1, $2, CURRENT_TIMESTAMP)
+      RETURNING id, report_type, generated_at
+    `;
+    
+    const result = await client.query(query, [type, data]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving report:', err);
+    res.status(500).json({ error: 'Failed to save report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Get Recent Reports
+app.get('/api/reports/recent', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT 
+        id,
+        report_type,
+        generated_at
+      FROM generated_reports
+      ORDER BY generated_at DESC
+      LIMIT 5
+    `;
+    
+    const result = await client.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching recent reports:', err);
+    res.status(500).json({ error: 'Failed to fetch recent reports' });
+  } finally {
+    client.release();
+  }
+});
+
+// Sleep Report CSV
+app.get('/api/reports/sleep/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      WITH daily_metrics AS (
+        SELECT
+          record_date as "Date",
+          ROUND(EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0::numeric, 2) as "Total Hours",
+          ROUND(deep::numeric, 2) as "Deep Sleep",
+          ROUND(core::numeric, 2) as "Core Sleep",
+          ROUND(rem::numeric, 2) as "REM Sleep",
+          ROUND(awake::numeric, 2) as "Time Awake",
+          ROUND((deep + core + rem)::numeric, 2) as "Total Sleep Time"
+        FROM sleep_analysis
+        WHERE record_date >= CURRENT_DATE - INTERVAL '30 days'
+        ORDER BY record_date DESC
+      )
+      SELECT * FROM daily_metrics
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=sleep_report.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('Error generating sleep report:', err);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Mood Report CSV
+app.get('/api/reports/mood/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        mood as "Mood",
+        logged_at as "Date",
+        recent_heart_rate as "Heart Rate",
+        energy_burnt as "Energy Burnt (kcal)",
+        total_sleep as "Sleep (hours)",
+        time_in_daylight as "Time in Daylight (minutes)"
+      FROM mental_health
+      ORDER BY logged_at DESC
+      LIMIT 30;
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=mood_report.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('Error generating mood report:', err);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Activity Report CSV
+app.get('/api/reports/activity/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        hr.timestamp::date                        AS "Date",
+        ROUND(SUM(hr.value))::integer            AS "Active Energy (kcal)"
+      FROM health_realtime AS hr
+      WHERE hr.metric_name = 'active_energy'
+        AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY hr.timestamp::date
+      ORDER BY "Date";
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=activity_report.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('Error generating activity report:', err);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Heart Rate Report CSV
+app.get('/api/reports/heart-rate/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        day as "Date",
+        avg_heart_rate as "Average Heart Rate (bpm)"
+      FROM (
+        SELECT
+          hr.timestamp::date                       AS day,
+          ROUND(AVG(hr.value)::numeric, 1)         AS avg_heart_rate
+        FROM health_realtime AS hr
+        WHERE hr.metric_name = 'heart_rate'
+          AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY hr.timestamp::date
+      ) AS sub
+      ORDER BY day;
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=heart_rate_report.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('Error generating heart rate report:', err);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Exercise Report CSV
+app.get('/api/reports/exercise/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        day as "Date",
+        total_exercise as "Total Exercise (minutes)"
+      FROM (
+        SELECT
+          hr.timestamp::date                     AS day,
+          ROUND(SUM(hr.value)::numeric, 1)         AS total_exercise
+        FROM health_aggregated  AS hr
+        WHERE hr.metric_name = 'apple_exercise_time'
+          AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY hr.timestamp::date
+      ) AS sub
+      ORDER BY day;
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=exercise_report.csv');
+    res.send(csv);
+  } catch (error) {
+    console.error('Error generating exercise report:', error);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Headphone Exposure Report CSV
+app.get('/api/reports/headphone-exposure/csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        day as "Date",
+        avg_headphone_exposure as "Average Audio Exposure (dB)"
+      FROM (
+        SELECT
+          hr.timestamp::date                     AS day,
+          ROUND(AVG(hr.value)::numeric, 1)         AS avg_headphone_exposure
+        FROM health_aggregated  AS hr
+        WHERE hr.metric_name = 'headphone_audio_exposure'
+          AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY hr.timestamp::date
+      ) AS sub
+      ORDER BY day;
+    `;
+
+    const result = await client.query(query);
+    
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'No data found' });
+      return;
+    }
+
+    const parser = new Parser();
+    const csv = parser.parse(result.rows);
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=headphone_exposure_report.csv');
+    res.send(csv);
+  } catch (error) {
+    console.error('Error generating headphone exposure report:', error);
+    res.status(500).json({ error: 'Failed to generate report' });
+  } finally {
+    client.release();
+  }
+});
+
+// Email reports endpoint
+app.post('/api/reports/email', upload.array('reports'), async (req, res) => {
+  try {
+    const { email } = req.body;
+    const attachments = req.files.map(file => ({
+      filename: file.originalname,
+      content: file.buffer
+    }));
+
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Health Reports',
+      text: 'Please find attached your health reports.',
+      attachments
+    };
+
+    await transporter.sendMail(mailOptions);
+    res.json({ message: 'Reports sent successfully' });
+  } catch (error) {
+    console.error('Error sending email:', error);
+    res.status(500).json({ error: 'Failed to send email' });
   }
 });
 

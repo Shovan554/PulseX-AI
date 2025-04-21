@@ -426,6 +426,8 @@ app.get('/api/sleep/weekly-timeline', async (req, res) => {
             ::numeric
           , 2
         ), 0) AS total_sleep_hours,
+        sa.sleep_start,
+        sa.sleep_end,
         COALESCE(ROUND(sa.deep::numeric, 2), 0) AS deep_sleep_hours,
         COALESCE(ROUND(sa.core::numeric, 2), 0) AS core_sleep_hours,
         COALESCE(ROUND(sa.rem::numeric, 2), 0) AS rem_sleep_hours,
@@ -438,8 +440,8 @@ app.get('/api/sleep/weekly-timeline', async (req, res) => {
     const result = await pool.query(query);
     res.json(result.rows);
   } catch (err) {
-    console.error('Error fetching sleep timeline:', err);
-    res.status(500).json({ error: 'Failed to fetch sleep timeline' });
+    console.error('Error fetching weekly timeline:', err);
+    res.status(500).json({ error: 'Failed to fetch weekly timeline' });
   }
 });
 
@@ -777,6 +779,159 @@ app.get('/api/health/stats', async (req, res) => {
   } catch (err) {
     console.error('Error fetching health stats:', err);
     res.status(500).json({ error: 'Failed to fetch health stats' });
+  } finally {
+    client.release();
+  }
+});
+
+// Mental health logging endpoint
+app.post('/api/mental-health/log', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { mood } = req.body;
+    
+    if (!mood) {
+      return res.status(400).json({ error: 'Mood is required' });
+    }
+
+    // Get recent metrics with ROUND to ensure integer values
+    const metricsQuery = `
+      WITH recent_metrics AS (
+        SELECT ROUND(value)::integer as heart_rate
+        FROM health_realtime
+        WHERE metric_name = 'heart_rate'
+        ORDER BY timestamp DESC
+        LIMIT 1
+      ),
+      daily_energy AS (
+        SELECT ROUND(COALESCE(SUM(value), 0))::integer as energy_burnt
+        FROM health_realtime
+        WHERE metric_name = 'active_energy'
+          AND timestamp::date = CURRENT_DATE
+      ),
+      latest_sleep AS (
+        SELECT ROUND(asleep)::integer as total_sleep
+        FROM sleep_analysis
+        WHERE record_date = CURRENT_DATE - INTERVAL '1 day'
+        LIMIT 1
+      )
+      SELECT 
+        (SELECT heart_rate FROM recent_metrics) as recent_heart_rate,
+        (SELECT energy_burnt FROM daily_energy) as energy_burnt,
+        (SELECT total_sleep FROM latest_sleep) as total_sleep
+    `;
+
+    const metricsResult = await client.query(metricsQuery);
+    const metrics = metricsResult.rows[0];
+
+    // Insert mood with metrics
+    const insertQuery = `
+      INSERT INTO mental_health (
+        mood, 
+        recent_heart_rate, 
+        energy_burnt, 
+        total_sleep
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING *`;
+    
+    const result = await client.query(insertQuery, [
+      mood,
+      Math.round(metrics.recent_heart_rate || 0),
+      Math.round(metrics.energy_burnt || 0),
+      Math.round(metrics.total_sleep || 0)
+    ]);
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Detailed error:', {
+      message: err.message,
+      stack: err.stack,
+      code: err.code,
+      detail: err.detail
+    });
+    res.status(500).json({ error: 'Failed to log mental health data' });
+  } finally {
+    client.release();
+  }
+});
+
+// Get current health metrics endpoint
+app.get('/api/health/current-metrics', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    // Get current heart rate
+    const heartRateQuery = `
+      SELECT value as heart_rate
+      FROM health_realtime
+      WHERE metric_name = 'heart_rate'
+      ORDER BY timestamp DESC
+      LIMIT 1`;
+    
+    // Get today's total energy burnt
+    const energyQuery = `
+      SELECT COALESCE(SUM(value), 0) as energy_burnt
+      FROM health_realtime
+      WHERE metric_name = 'active_energy'
+        AND timestamp::date = CURRENT_DATE`;
+    
+    // Get latest sleep duration
+    const sleepQuery = `
+      SELECT asleep as total_sleep
+      FROM sleep_analysis
+      WHERE record_date = CURRENT_DATE - INTERVAL '1 day'
+      LIMIT 1`;
+    
+    // Get today's time in daylight
+    const daylightQuery = `
+      SELECT COALESCE(SUM(value), 0) as time_in_daylight
+      FROM health_aggregated
+      WHERE metric_name = 'time_in_daylight'
+        AND timestamp::date = CURRENT_DATE`;
+    
+    const [heartRate, energy, sleep, daylight] = await Promise.all([
+      client.query(heartRateQuery),
+      client.query(energyQuery),
+      client.query(sleepQuery),
+      client.query(daylightQuery)
+    ]);
+    
+    res.json({
+      heart_rate: heartRate.rows[0]?.heart_rate,
+      energy_burnt: energy.rows[0]?.energy_burnt,
+      total_sleep: sleep.rows[0]?.total_sleep,
+      time_in_daylight: daylight.rows[0]?.time_in_daylight
+    });
+  } catch (err) {
+    console.error('Error fetching current metrics:', err);
+    res.status(500).json({ error: 'Failed to fetch current metrics' });
+  } finally {
+    client.release();
+  }
+});
+
+// Get recent mental health logs
+app.get('/api/mental-health/recent', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT 
+        m.id,
+        m.mood,
+        m.recent_heart_rate,
+        m.energy_burnt,
+        m.total_sleep,
+        m.logged_at
+      FROM mental_health m
+      ORDER BY m.logged_at DESC
+      LIMIT 10
+    `;
+    
+    const result = await client.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching recent mental health logs:', err);
+    res.status(500).json({ error: 'Failed to fetch mental health history' });
   } finally {
     client.release();
   }

@@ -1,48 +1,378 @@
-const { Parser } = require('json2csv');
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const multer = require('multer');
-const nodemailer = require('nodemailer');
-const upload = multer({ storage: multer.memoryStorage() });
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import { Parser } from 'json2csv';
+import { spawn } from 'child_process';
+import * as fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import os from 'os';
+import pg from 'pg';
+import dotenv from 'dotenv';
+import OpenAI from 'openai';
+import { WebSocketServer } from 'ws';
+import http from 'http';
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
+const upload = multer();
 
-// Configure CORS
+// Create HTTP server instance
+const server = http.createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocketServer({ server });
+
+// WebSocket connection handling
+wss.on('connection', (ws) => {
+  console.log('New client connected');
+  
+  ws.on('error', console.error);
+  
+  ws.on('close', () => {
+    console.log('Client disconnected');
+  });
+});
+
+// Add middleware first
+app.use(cors({
+  origin: 'http://localhost:3000', // Your React app's URL - must be explicit
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));  // Make sure you have cors package installed
+app.use(express.json({limit: '50mb'}));
+app.use(express.urlencoded({limit: '50mb', extended: true}));
+
+// Then add routes
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+const queries = {
+  respiratoryRate: {
+    current: `
+      SELECT 
+        ROUND(value)::integer as current_resp_rate,
+        timestamp as reading_time
+      FROM health_realtime
+      WHERE metric_name = 'respiratory_rate'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `,
+    dailyAverage: `
+      SELECT 
+        ROUND(COALESCE(AVG(value), 0))::integer as avg_resp_rate_today
+      FROM health_realtime
+      WHERE metric_name = 'respiratory_rate'
+        AND timestamp::date = CURRENT_DATE
+    `
+  },
+  daylight: {
+    weekly: `
+      WITH today_daylight AS (
+        SELECT COALESCE(SUM(value), 0)::int AS time_in_daylight_today
+        FROM health_aggregated
+        WHERE metric_name = 'time_in_daylight'
+          AND timestamp::date = CURRENT_DATE
+      ),
+      daily_daylight AS (
+        SELECT
+          timestamp::date                AS day,
+          SUM(value)                     AS total_daylight_minutes
+        FROM health_aggregated
+        WHERE metric_name = 'time_in_daylight'
+          AND timestamp::date >= CURRENT_DATE - INTERVAL '6 days'
+        GROUP BY 1
+      ),
+      weekly_avg AS (
+        SELECT
+          COALESCE(AVG(total_daylight_minutes), 0)::int AS avg_time_in_daylight_7d
+        FROM daily_daylight
+      )
+      SELECT 
+        t.time_in_daylight_today as today,
+        w.avg_time_in_daylight_7d as weekly_average
+      FROM today_daylight t, weekly_avg w`
+  },
+  headphoneExposure: {
+    latest: `
+      WITH current_exposure AS (
+        SELECT 
+          COALESCE(ROUND(value::numeric, 0), 0) as current_exposure,
+          timestamp as reading_time
+        FROM health_aggregated
+        WHERE metric_name = 'headphone_audio_exposure'
+        ORDER BY timestamp DESC
+        LIMIT 1
+      ),
+      weekly_avg AS (
+        SELECT
+          COALESCE(ROUND(AVG(value)::numeric, 0), 0) AS avg_headphone_audio_exposure_7d
+        FROM health_aggregated
+        WHERE metric_name = 'headphone_audio_exposure'
+          AND timestamp >= NOW() - INTERVAL '7 days'
+      )
+      SELECT 
+        c.current_exposure as value,
+        c.reading_time as timestamp,
+        w.avg_headphone_audio_exposure_7d as weekly_average
+      FROM current_exposure c, weekly_avg w`
+  },
+  getCurrentHealthStats: `
+    WITH
+    -- 1. Heart rate
+    curr_hr AS (
+      SELECT ROUND(value)::int AS current_heart_rate
+      FROM health_realtime
+      WHERE metric_name = 'heart_rate'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ),
+    avg_hr AS (
+      SELECT ROUND(AVG(value)::numeric,1) AS avg_heart_rate_today
+      FROM health_realtime
+      WHERE metric_name = 'heart_rate'
+        AND timestamp::date = CURRENT_DATE
+    ),
+    -- 2. Respiratory rate
+    curr_resp AS (
+      SELECT ROUND(value)::int AS current_respiratory_rate
+      FROM health_realtime
+      WHERE metric_name = 'respiratory_rate'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ),
+    avg_resp AS (
+      SELECT ROUND(AVG(value)::numeric,1) AS avg_respiratory_rate_today
+      FROM health_realtime
+      WHERE metric_name = 'respiratory_rate'
+        AND timestamp::date = CURRENT_DATE
+    ),
+    -- 3. Heart rate variability
+    curr_hrv AS (
+      SELECT value AS current_hr_variability
+      FROM health_aggregated
+      WHERE metric_name = 'heart_rate_variability'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ),
+    avg_hrv AS (
+      SELECT ROUND(AVG(value)::numeric,2) AS avg_hr_variability_10d
+      FROM health_aggregated
+      WHERE metric_name = 'heart_rate_variability'
+        AND timestamp >= CURRENT_DATE - INTERVAL '10 days'
+    ),
+    -- 4. Sleep temperature
+    curr_temp AS (
+      SELECT value AS current_sleeping_temperature
+      FROM health_aggregated
+      WHERE metric_name = 'apple_sleeping_wrist_temperature'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ),
+    avg_temp AS (
+      SELECT ROUND(AVG(value)::numeric,2) AS avg_sleeping_temperature_7d
+      FROM health_aggregated
+      WHERE metric_name = 'apple_sleeping_wrist_temperature'
+        AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+    ),
+    -- 5. Audio exposure
+    curr_audio AS (
+      SELECT COALESCE(ROUND(value::numeric, 0), 0) AS current_audio_exposure
+      FROM health_aggregated
+      WHERE metric_name = 'headphone_audio_exposure'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ),
+    avg_audio AS (
+      SELECT COALESCE(ROUND(AVG(value)::numeric, 0), 0) AS avg_audio_exposure_7d
+      FROM health_aggregated
+      WHERE metric_name = 'headphone_audio_exposure'
+        AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+    ),
+    -- 6. Latest sleep
+    latest_sleep AS (
+      SELECT
+        COALESCE((deep + core + rem), 0) AS total_sleep_last,
+        COALESCE(deep, 0) AS deep_sleep_last,
+        COALESCE(rem, 0) AS rem_sleep_last
+      FROM sleep_analysis
+      WHERE record_date = CURRENT_DATE - INTERVAL '1 day'
+      ORDER BY record_date DESC
+      LIMIT 1
+    ),
+    -- 7. Steps today
+    steps_today AS (
+      SELECT COALESCE(SUM(value), 0) AS total_steps_today
+      FROM health_realtime
+      WHERE metric_name = 'step_count'
+        AND timestamp::date = CURRENT_DATE
+    ),
+    -- 8. Exercise time today
+    exercise_today AS (
+      SELECT COALESCE(SUM(value), 0) AS exercise_time_today
+      FROM health_aggregated
+      WHERE metric_name = 'apple_exercise_time'
+        AND timestamp::date = CURRENT_DATE
+    ),
+    -- 9. Daylight exposure today
+    daylight_today AS (
+      SELECT COALESCE(SUM(value), 0) AS time_in_daylight_today
+      FROM health_aggregated
+      WHERE metric_name = 'time_in_daylight'
+        AND timestamp::date = CURRENT_DATE
+    ),
+    -- 10. Latest mood
+    latest_mood AS (
+      SELECT mood AS latest_mood
+      FROM mental_health
+      ORDER BY logged_at DESC
+      LIMIT 1
+    )
+    SELECT json_build_object(
+      'current_heart_rate',        curr_hr.current_heart_rate,
+      'avg_heart_rate_today',      avg_hr.avg_heart_rate_today,
+      'current_respiratory_rate',  curr_resp.current_respiratory_rate,
+      'avg_respiratory_rate_today',avg_resp.avg_respiratory_rate_today,
+      'current_hr_variability',    curr_hrv.current_hr_variability,
+      'avg_hr_variability_10d',    avg_hrv.avg_hr_variability_10d,
+      'current_sleeping_temperature', curr_temp.current_sleeping_temperature,
+      'avg_sleeping_temperature_7d',  avg_temp.avg_sleeping_temperature_7d,
+      'current_audio_exposure',    curr_audio.current_audio_exposure,
+      'avg_audio_exposure_7d',     avg_audio.avg_audio_exposure_7d,
+      'total_sleep_last',          latest_sleep.total_sleep_last,
+      'deep_sleep_last',           latest_sleep.deep_sleep_last,
+      'rem_sleep_last',            latest_sleep.rem_sleep_last,
+      'total_steps_today',         steps_today.total_steps_today,
+      'exercise_time_today',       exercise_today.exercise_time_today,
+      'time_in_daylight_today',    daylight_today.time_in_daylight_today,
+      'latest_mood',               latest_mood.latest_mood
+    ) AS health_report
+    FROM curr_hr
+    JOIN avg_hr         ON true
+    JOIN curr_resp      ON true
+    JOIN avg_resp       ON true
+    JOIN curr_hrv       ON true
+    JOIN avg_hrv        ON true
+    JOIN curr_temp      ON true
+    JOIN avg_temp       ON true
+    JOIN curr_audio     ON true
+    JOIN avg_audio      ON true
+    JOIN latest_sleep   ON true
+    JOIN steps_today    ON true
+    JOIN exercise_today ON true
+    JOIN daylight_today ON true
+    JOIN latest_mood    ON true;
+  `
+};
+
+// Configure CORS and JSON parsing
 app.use(cors());
-app.use(express.json());
+app.use(express.json({limit: '50mb'}));
 
-// Database configuration - using your actual credentials from db.js
-const pool = new Pool({
+// Create PostgreSQL pool
+const pool = new pg.Pool({
   user: 'shovan',
   host: 'localhost',
   database: 'health_data',
-  password: '', // Your password if any
+  password: '',
   port: 5432,
 });
 
-// Email configuration
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false, // true for 465, false for other ports
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
-  },
-  tls: {
-    rejectUnauthorized: false
-  }
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
-// Test email configuration on server start
-transporter.verify(function(error, success) {
-  if (error) {
-    console.log('Email configuration error:', error);
-  } else {
-    console.log('Email server is ready to send messages');
+// Function to save blob to temporary file
+async function saveBlobToTemp(blob, filename) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'health-reports-'));
+  const filepath = path.join(tempDir, filename);
+  await fs.writeFile(filepath, blob);
+  return { filepath, tempDir };
+}
+
+// Function to clean up temporary files
+async function cleanupTempFiles(tempDir) {
+  try {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  } catch (error) {
+    console.error('Error cleaning up temp files:', error);
+  }
+}
+
+// Email reports endpoint
+app.post('/api/reports/email', upload.array('reports'), async (req, res) => {
+  let tempDir = null;
+  
+  try {
+    if (!req.files || req.files.length === 0) {
+      throw new Error('No reports provided');
+    }
+
+    // Create temp directory
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'health-reports-'));
+
+    // Save uploaded files to temp directory
+    const filePaths = await Promise.all(
+      req.files.map(async (file) => {
+        const filepath = path.join(tempDir, file.originalname);
+        await fs.writeFile(filepath, file.buffer);
+        return filepath;
+      })
+    );
+
+    // Call Python script to send email
+    const pythonArgs = [
+      'sendEmail.py',
+      '--files', ...filePaths,
+      '--sender', 'Shovan.rautt@gmail.com',
+      '--receiver', 'sraut@caldwell.edu',
+      '--subject', 'Your Health Reports',
+      '--body', 'Please find attached your health reports.\n\nBest regards.'
+    ];
+
+    const pythonProcess = spawn('python3', pythonArgs);
+
+    let outputData = '';
+    let errorData = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      outputData += data.toString();
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      errorData += data.toString();
+    });
+
+    await new Promise((resolve, reject) => {
+      pythonProcess.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Python script failed with code ${code}: ${errorData}`));
+        }
+      });
+
+      pythonProcess.on('error', (error) => {
+        reject(new Error(`Failed to start Python process: ${error.message}`));
+      });
+    });
+
+    res.json({ message: 'Reports sent successfully' });
+
+  } catch (error) {
+    console.error('Error sending email:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (tempDir) {
+      await cleanupTempFiles(tempDir);
+    }
   }
 });
 
@@ -140,6 +470,13 @@ app.post("/api/data", async (req, res) => {
         console.error(`❌ Error processing metric ${name}:`, metricError);
       }
     }
+
+    // Notify all connected clients about the new data
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'REFRESH_DATA' }));
+      }
+    });
 
     res.json({ 
       success: true, 
@@ -370,49 +707,43 @@ app.get('/api/steps/weekly', async (req, res) => {
 // Respiratory rate endpoints
 app.get('/api/respiratory-rate/current', async (req, res) => {
   try {
-    const query = queries.respiratoryRate.current;
-    const result = await pool.query(query);
+    const result = await pool.query(queries.respiratoryRate.current);
     res.json(result.rows[0] || { current_resp_rate: null, reading_time: null });
   } catch (err) {
     console.error('Error fetching current respiratory rate:', err);
-    res.status(500).json({ error: 'Failed to fetch respiratory rate data' });
+    res.status(500).json({ 
+      error: 'Failed to fetch respiratory rate data',
+      details: err.message 
+    });
   }
 });
 
 app.get('/api/respiratory-rate/daily-average', async (req, res) => {
   try {
-    const query = queries.respiratoryRate.dailyAverage;
-    const result = await pool.query(query);
+    const result = await pool.query(queries.respiratoryRate.dailyAverage);
+    console.log('Respiratory rate average result:', result.rows[0]); // Debug log
     res.json(result.rows[0] || { avg_resp_rate_today: null });
   } catch (err) {
     console.error('Error fetching average respiratory rate:', err);
-    res.status(500).json({ error: 'Failed to fetch average respiratory rate data' });
+    res.status(500).json({ 
+      error: 'Failed to fetch average respiratory rate data',
+      details: err.message 
+    });
   }
 });
 
 // Time in daylight endpoint
 app.get('/api/daylight/weekly', async (req, res) => {
   try {
-    const query = queries.timeInDaylight.weeklyStats;
-    const result = await pool.query(query);
-    
-    // Calculate average excluding today if today's data exists
-    const today = new Date().toISOString().split('T')[0];
-    const todayData = result.rows.find(row => row.day.toISOString().split('T')[0] === today);
-    const previousDays = result.rows.filter(row => row.day.toISOString().split('T')[0] !== today);
-    
-    const avgMinutes = previousDays.length > 0
-      ? previousDays.reduce((sum, day) => sum + parseFloat(day.total_minutes), 0) / previousDays.length
-      : 0;
-
-    res.json({
-      today: todayData?.total_minutes || 0,
-      weeklyAverage: Math.round(avgMinutes),
-      dailyData: result.rows
-    });
+    const result = await pool.query(queries.daylight.weekly);
+    console.log('Daylight query result:', result.rows[0]); // Debug log
+    res.json(result.rows[0] || { today: 0, weekly_average: 0 });
   } catch (err) {
     console.error('Error fetching daylight data:', err);
-    res.status(500).json({ error: 'Failed to fetch daylight data' });
+    res.status(500).json({ 
+      error: 'Failed to fetch daylight data',
+      details: err.message 
+    });
   }
 });
 
@@ -420,15 +751,15 @@ app.get('/api/daylight/weekly', async (req, res) => {
 app.get('/api/sleep/weekly-average', async (req, res) => {
   try {
     const query = `
-      SELECT
-        ROUND(
-          AVG(
-            EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0
-            ::numeric
-          )
-        , 2) AS average
-      FROM sleep_analysis
-      WHERE record_date >= CURRENT_DATE - INTERVAL '6 days'`;
+      SELECT ROUND(AVG(total_sleep_hours)::numeric, 2) AS average
+      FROM (
+        SELECT
+          record_date::date AS day,
+          ROUND(SUM(deep + core + rem)::numeric, 2) AS total_sleep_hours
+        FROM sleep_analysis
+        WHERE record_date >= CURRENT_DATE - INTERVAL '6 days'
+        GROUP BY day
+      ) daily_sleep`;
     
     const result = await pool.query(query);
     res.json({ average: result.rows[0].average || null });
@@ -443,16 +774,16 @@ app.get('/api/sleep/latest', async (req, res) => {
     const query = `
       SELECT
         record_date,
-        ROUND(
-          EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0
-          ::numeric
-        , 2) AS total_sleep_hours,
-        ROUND(deep   ::numeric, 2) AS deep_sleep_hours,
-        ROUND(core   ::numeric, 2) AS core_sleep_hours,
-        ROUND(rem    ::numeric, 2) AS rem_sleep_hours
+        ROUND(SUM(deep + core + rem)::numeric, 2) AS total_sleep_hours,
+        ROUND(deep::numeric, 2) AS deep_sleep_hours,
+        ROUND(core::numeric, 2) AS core_sleep_hours,
+        ROUND(rem::numeric, 2) AS rem_sleep_hours
       FROM sleep_analysis
-      ORDER BY record_date DESC
-      LIMIT 1`;
+      WHERE record_date = (
+        SELECT MAX(record_date)
+        FROM sleep_analysis
+      )
+      GROUP BY record_date, deep, core, rem`;
     
     const result = await pool.query(query);
     res.json(result.rows[0] || null);
@@ -475,11 +806,8 @@ app.get('/api/sleep/weekly-timeline', async (req, res) => {
       SELECT
         dr.date as record_date,
         COALESCE(
-          ROUND(
-            EXTRACT(EPOCH FROM (sa.sleep_end - sa.sleep_start)) / 3600.0
-            ::numeric
-          , 2
-        ), 0) AS total_sleep_hours,
+          ROUND(SUM(sa.deep + sa.core + sa.rem)::numeric, 2)
+        , 0) AS total_sleep_hours,
         sa.sleep_start,
         sa.sleep_end,
         COALESCE(ROUND(sa.deep::numeric, 2), 0) AS deep_sleep_hours,
@@ -487,15 +815,22 @@ app.get('/api/sleep/weekly-timeline', async (req, res) => {
         COALESCE(ROUND(sa.rem::numeric, 2), 0) AS rem_sleep_hours,
         COALESCE(ROUND(sa.awake::numeric, 2), 0) AS awake_hours
       FROM date_range dr
-      LEFT JOIN sleep_analysis sa ON dr.date = sa.record_date
-      ORDER BY dr.date ASC;
-    `;
-    
+      LEFT JOIN sleep_analysis sa ON dr.date = sa.record_date::date
+      GROUP BY 
+        dr.date, 
+        sa.sleep_start, 
+        sa.sleep_end, 
+        sa.deep, 
+        sa.core, 
+        sa.rem, 
+        sa.awake
+      ORDER BY dr.date ASC`;
+
     const result = await pool.query(query);
     res.json(result.rows);
   } catch (err) {
-    console.error('Error fetching weekly timeline:', err);
-    res.status(500).json({ error: 'Failed to fetch weekly timeline' });
+    console.error('Error fetching sleep timeline:', err);
+    res.status(500).json({ error: 'Failed to fetch sleep timeline' });
   }
 });
 
@@ -622,10 +957,19 @@ app.get('/api/headphone-exposure/latest', async (req, res) => {
   try {
     const query = queries.headphoneExposure.latest;
     const result = await pool.query(query);
-    res.json(result.rows[0] || { value: null, timestamp: null });
+    console.log('Headphone exposure data:', result.rows[0]); // Debug log
+    
+    res.json(result.rows[0] || { 
+      value: 0, 
+      timestamp: null, 
+      weekly_average: 0 
+    });
   } catch (err) {
     console.error('Error fetching headphone exposure data:', err);
-    res.status(500).json({ error: 'Failed to fetch headphone exposure data' });
+    res.status(500).json({ 
+      error: 'Failed to fetch headphone exposure data',
+      details: err.message 
+    });
   }
 });
 
@@ -635,11 +979,11 @@ app.get('/api/trends/weekly', async (req, res) => {
   try {
     const weeklyQuery = `
       WITH 
-      -- Sleep data by week
+      -- Sleep data by week using accurate calculation
       sleep_week AS (
         SELECT
-          date_trunc('week', sleep_start::date)::date AS week_start,
-          SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0 AS total_sleep_hrs
+          date_trunc('week', record_date::date)::date AS week_start,
+          ROUND(SUM(deep + core + rem)::numeric, 2) AS total_sleep_hrs
         FROM sleep_analysis
         GROUP BY 1
       ),
@@ -672,15 +1016,13 @@ app.get('/api/trends/weekly', async (req, res) => {
           JOIN metrics_week m2 ON m2.week_start = s2.week_start
         WHERE s1.week_start = date_trunc('week', CURRENT_DATE - INTERVAL '2 week')
       )
-      
-      -- Calculate final results with percentage changes
       SELECT json_build_object(
         'sleep_current', ROUND(sleep_current::numeric, 2),
         'sleep_previous', ROUND(sleep_previous::numeric, 2),
         'sleep_pct_change', ROUND(((sleep_current - sleep_previous) / NULLIF(sleep_previous, 0) * 100)::numeric, 2),
         
-        'heart_rate_current', heart_rate_current,
-        'heart_rate_previous', heart_rate_previous,
+        'heart_rate_current', ROUND(heart_rate_current::numeric, 1),
+        'heart_rate_previous', ROUND(heart_rate_previous::numeric, 1),
         'heart_rate_pct_change', ROUND(((heart_rate_current - heart_rate_previous) / NULLIF(heart_rate_previous, 0) * 100)::numeric, 2),
         
         'steps_current', ROUND(steps_current::numeric, 0),
@@ -710,19 +1052,25 @@ app.get('/api/trends/daily', async (req, res) => {
   try {
     const dailyQuery = `
       WITH 
-      -- Daily sleep metrics
+      -- Daily sleep metrics using latest sleep record
       sleep_metrics AS (
         SELECT
           COALESCE(
-            (SELECT SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0
+            (SELECT ROUND(SUM(deep + core + rem)::numeric, 2)
              FROM sleep_analysis
-             WHERE sleep_start::date = CURRENT_DATE),
+             WHERE record_date = (
+               SELECT MAX(record_date)
+               FROM sleep_analysis
+             )),
             0
           ) as current_sleep,
           COALESCE(
-            (SELECT SUM(EXTRACT(epoch FROM (sleep_end - sleep_start))) / 3600.0
+            (SELECT ROUND(SUM(deep + core + rem)::numeric, 2)
              FROM sleep_analysis
-             WHERE sleep_start::date = CURRENT_DATE - INTERVAL '1 day'),
+             WHERE record_date = (
+               SELECT MAX(record_date) - 1
+               FROM sleep_analysis
+             )),
             0
           ) as previous_sleep
       ),
@@ -754,7 +1102,10 @@ app.get('/api/trends/daily', async (req, res) => {
       SELECT json_build_object(
         'sleep_current', ROUND(s.current_sleep::numeric, 2),
         'sleep_previous', ROUND(s.previous_sleep::numeric, 2),
-        'sleep_pct_change', ROUND(((s.current_sleep - s.previous_sleep) / NULLIF(s.previous_sleep, 0) * 100)::numeric, 2),
+        'sleep_pct_change', CASE 
+          WHEN s.previous_sleep = 0 THEN 0
+          ELSE ROUND(((s.current_sleep - s.previous_sleep) / NULLIF(s.previous_sleep, 0) * 100)::numeric, 2)
+        END,
         
         'heart_rate_current', ROUND((SELECT current_value FROM daily_metrics WHERE metric_name = 'heart_rate')::numeric, 1),
         'heart_rate_previous', ROUND((SELECT previous_value FROM daily_metrics WHERE metric_name = 'heart_rate')::numeric, 1),
@@ -797,35 +1148,73 @@ app.get('/api/health/stats', async (req, res) => {
     const statsQuery = `
       WITH heart_rate_stats AS (
         SELECT 
-          ROUND(AVG(value)::numeric, 0) as recent_resting_hr
+          ROUND(AVG(value)::numeric, 0) as recent_resting_hr,
+          (
+            SELECT ROUND(AVG(value)::numeric, 0)
+            FROM health_aggregated 
+            WHERE metric_name = 'resting_heart_rate'
+              AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+          ) as avg_resting_hr
         FROM health_aggregated 
         WHERE metric_name = 'resting_heart_rate'
           AND timestamp >= CURRENT_DATE - INTERVAL '24 hours'
       ),
-      audio_exposure AS (
+      hrv_stats AS (
         SELECT 
-          ROUND(AVG(value)::numeric, 0) as recent_audio_exposure
-        FROM health_aggregated 
-        WHERE metric_name = 'headphone_audio_exposure'
-          AND timestamp >= CURRENT_DATE - INTERVAL '24 hours'
+          (SELECT value 
+           FROM health_aggregated
+           WHERE metric_name = 'heart_rate_variability'
+           ORDER BY timestamp DESC
+           LIMIT 1) as recent_hr_variability,
+          (
+            SELECT ROUND(AVG(value)::numeric, 2)
+            FROM health_aggregated
+            WHERE metric_name = 'heart_rate_variability'
+              AND timestamp >= CURRENT_DATE - INTERVAL '10 days'
+          ) as avg_hr_variability_10d
+      ),
+      sleep_temp_stats AS (
+        SELECT 
+          (SELECT value 
+           FROM health_aggregated
+           WHERE metric_name = 'apple_sleeping_wrist_temperature'
+           ORDER BY timestamp DESC
+           LIMIT 1) as recent_sleeping_temperature,
+          (
+            SELECT ROUND(AVG(value)::numeric, 2)
+            FROM health_aggregated
+            WHERE metric_name = 'apple_sleeping_wrist_temperature'
+              AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+          ) as avg_sleeping_temperature
+      ),
+      audio_exposure_stats AS (
+        SELECT 
+          (SELECT COALESCE(ROUND(value::numeric, 0), 0) as recent_audio_exposure
+           FROM health_aggregated
+           WHERE metric_name = 'headphone_audio_exposure'
+           ORDER BY timestamp DESC
+           LIMIT 1) as recent_audio_exposure,
+          (
+            SELECT COALESCE(ROUND(AVG(value)::numeric, 0), 0) as avg_audio_exposure
+            FROM health_aggregated
+            WHERE metric_name = 'headphone_audio_exposure'
+              AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
+          ) as avg_audio_exposure
       )
       SELECT json_build_object(
         'recent_resting_hr', hr.recent_resting_hr,
-        'avg_resting_hr', (
-          SELECT ROUND(AVG(value)::numeric, 0)
-          FROM health_aggregated 
-          WHERE metric_name = 'resting_heart_rate'
-            AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
-        ),
-        'recent_audio_exposure', ae.recent_audio_exposure,
-        'avg_audio_exposure', (
-          SELECT ROUND(AVG(value)::numeric, 0)
-          FROM health_aggregated 
-          WHERE metric_name = 'headphone_audio_exposure'
-            AND timestamp >= CURRENT_DATE - INTERVAL '7 days'
-        )
+        'avg_resting_hr', hr.avg_resting_hr,
+        'recent_hr_variability', hrv.recent_hr_variability,
+        'avg_hr_variability_10d', hrv.avg_hr_variability_10d,
+        'recent_sleeping_temperature', st.recent_sleeping_temperature,
+        'avg_sleeping_temperature', st.avg_sleeping_temperature,
+        'recent_audio_exposure', COALESCE(ae.recent_audio_exposure, 0),
+        'avg_audio_exposure', COALESCE(ae.avg_audio_exposure, 0)
       ) as stats
-      FROM heart_rate_stats hr, audio_exposure ae;
+      FROM heart_rate_stats hr, 
+           hrv_stats hrv, 
+           sleep_temp_stats st,
+           audio_exposure_stats ae;
     `;
 
     const result = await client.query(statsQuery);
@@ -848,63 +1237,139 @@ app.post('/api/mental-health/log', async (req, res) => {
       return res.status(400).json({ error: 'Mood is required' });
     }
 
-    // Get recent metrics with ROUND to ensure integer values
     const metricsQuery = `
-      WITH recent_metrics AS (
-        SELECT ROUND(value)::integer as heart_rate
+      WITH current_metrics AS (
+        SELECT value as heart_rate
         FROM health_realtime
         WHERE metric_name = 'heart_rate'
         ORDER BY timestamp DESC
         LIMIT 1
       ),
       daily_energy AS (
-        SELECT ROUND(COALESCE(SUM(value), 0))::integer as energy_burnt
+        SELECT COALESCE(SUM(value), 0) as energy_burnt
         FROM health_realtime
         WHERE metric_name = 'active_energy'
-          AND timestamp::date = CURRENT_DATE
+        AND timestamp::date = CURRENT_DATE
+      ),
+      daily_daylight AS (
+        SELECT COALESCE(SUM(value), 0) as daylight_minutes
+        FROM health_aggregated
+        WHERE metric_name = 'time_in_daylight'
+        AND timestamp::date = CURRENT_DATE
       ),
       latest_sleep AS (
-        SELECT ROUND(asleep)::integer as total_sleep
+        SELECT 
+          COALESCE((deep + core + rem), 0) as total_sleep_hours
         FROM sleep_analysis
         WHERE record_date = CURRENT_DATE - INTERVAL '1 day'
+        ORDER BY record_date DESC
         LIMIT 1
       )
       SELECT 
-        (SELECT heart_rate FROM recent_metrics) as recent_heart_rate,
-        (SELECT energy_burnt FROM daily_energy) as energy_burnt,
-        (SELECT total_sleep FROM latest_sleep) as total_sleep
-    `;
+        COALESCE((SELECT heart_rate FROM current_metrics), 0) as recent_heart_rate,
+        COALESCE((SELECT energy_burnt FROM daily_energy), 0) as energy_burnt,
+        COALESCE((SELECT total_sleep_hours FROM latest_sleep), 0) as total_sleep,
+        COALESCE((SELECT daylight_minutes FROM daily_daylight), 0) as time_in_daylight`;
 
     const metricsResult = await client.query(metricsQuery);
     const metrics = metricsResult.rows[0];
 
-    // Insert mood with metrics
+    console.log('Metrics before insert:', metrics);
+
     const insertQuery = `
       INSERT INTO mental_health (
         mood, 
         recent_heart_rate, 
         energy_burnt, 
-        total_sleep
+        total_sleep,
+        time_in_daylight
       )
-      VALUES ($1, $2, $3, $4)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *`;
     
     const result = await client.query(insertQuery, [
       mood,
       Math.round(metrics.recent_heart_rate || 0),
       Math.round(metrics.energy_burnt || 0),
-      Math.round(metrics.total_sleep || 0)
+      Number(metrics.total_sleep || 0),
+      Math.round(metrics.time_in_daylight || 0)
     ]);
     
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Detailed error:', {
+    console.error('Database Error:', {
       message: err.message,
       stack: err.stack,
       code: err.code,
       detail: err.detail
     });
-    res.status(500).json({ error: 'Failed to log mental health data' });
+    res.status(500).json({ 
+      error: 'Failed to log mental health data',
+      details: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// New endpoint for stress level calculation
+app.get('/api/stress-level', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      WITH latest_metrics AS (
+        SELECT 
+          (SELECT value::numeric 
+           FROM health_realtime 
+           WHERE metric_name = 'heart_rate' 
+           ORDER BY timestamp DESC 
+           LIMIT 1) as heart_rate,
+          
+          (SELECT (deep + core + rem)
+           FROM sleep_analysis 
+           WHERE record_date = CURRENT_DATE - INTERVAL '1 day'
+           ORDER BY record_date DESC
+           LIMIT 1) as sleep_hours,
+          
+          (SELECT COUNT(*) 
+           FROM mental_health 
+           WHERE mood = '😢' 
+           AND logged_at > NOW() - INTERVAL '24 hours') as negative_moods
+      )
+      SELECT 
+        COALESCE(heart_rate, 0) as heart_rate,
+        COALESCE(sleep_hours, 0) as sleep_hours,
+        COALESCE(negative_moods, 0) as negative_moods,
+        CASE
+          WHEN COALESCE(heart_rate, 0) > 90 OR COALESCE(sleep_hours, 0) < 6 OR COALESCE(negative_moods, 0) > 2 THEN 'high'
+          WHEN COALESCE(heart_rate, 0) > 75 OR COALESCE(sleep_hours, 0) < 7 OR COALESCE(negative_moods, 0) > 0 THEN 'moderate'
+          ELSE 'low'
+        END as stress_level,
+        CASE
+          WHEN COALESCE(heart_rate, 0) > 90 OR COALESCE(sleep_hours, 0) < 6 OR COALESCE(negative_moods, 0) > 2 THEN 80
+          WHEN COALESCE(heart_rate, 0) > 75 OR COALESCE(sleep_hours, 0) < 7 OR COALESCE(negative_moods, 0) > 0 THEN 50
+          ELSE 20
+        END as stress_score
+      FROM latest_metrics`;
+
+    const result = await client.query(query);
+    
+    res.json({
+      score: result.rows[0].stress_score,
+      maxScore: 100,
+      level: result.rows[0].stress_level,
+      metrics: {
+        heartRate: result.rows[0].heart_rate,
+        sleepHours: result.rows[0].sleep_hours,
+        negativeMoods: result.rows[0].negative_moods
+      }
+    });
+  } catch (err) {
+    console.error('Error calculating stress level:', err);
+    res.status(500).json({ 
+      error: 'Failed to calculate stress level',
+      details: err.message 
+    });
   } finally {
     client.release();
   }
@@ -1192,30 +1657,28 @@ app.get('/api/reports/sleep/csv', async (req, res) => {
   const client = await pool.connect();
   try {
     const query = `
-      WITH daily_metrics AS (
-        SELECT
-          record_date as "Date",
-          ROUND(EXTRACT(EPOCH FROM (sleep_end - sleep_start)) / 3600.0::numeric, 2) as "Total Hours",
-          ROUND(deep::numeric, 2) as "Deep Sleep",
-          ROUND(core::numeric, 2) as "Core Sleep",
-          ROUND(rem::numeric, 2) as "REM Sleep",
-          ROUND(awake::numeric, 2) as "Time Awake",
-          ROUND((deep + core + rem)::numeric, 2) as "Total Sleep Time"
-        FROM sleep_analysis
-        WHERE record_date >= CURRENT_DATE - INTERVAL '30 days'
-        ORDER BY record_date DESC
-      )
-      SELECT * FROM daily_metrics
+      SELECT
+        record_date AS "Date",
+        ROUND((deep + core + rem)::numeric, 2) AS "Total Sleep (hours)",
+        ROUND(deep::numeric, 2) AS "Deep Sleep (hours)",
+        ROUND(core::numeric, 2) AS "Core Sleep (hours)",
+        ROUND(rem::numeric, 2) AS "REM Sleep (hours)",
+        ROUND(awake::numeric, 2) AS "Time Awake (hours)"
+      FROM sleep_analysis
+      WHERE record_date >= CURRENT_DATE - INTERVAL '30 days'
+      ORDER BY record_date DESC;
     `;
 
     const result = await client.query(query);
     
     if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
+      res.status(404).json({ error: 'No sleep data found' });
       return;
     }
 
-    const parser = new Parser();
+    const fields = ['Date', 'Total Sleep (hours)', 'Deep Sleep (hours)', 'Core Sleep (hours)', 'REM Sleep (hours)', 'Time Awake (hours)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
@@ -1223,7 +1686,7 @@ app.get('/api/reports/sleep/csv', async (req, res) => {
     res.send(csv);
   } catch (err) {
     console.error('Error generating sleep report:', err);
-    res.status(500).json({ error: 'Failed to generate report' });
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
@@ -1235,25 +1698,22 @@ app.get('/api/reports/mood/csv', async (req, res) => {
   try {
     const query = `
       SELECT
-        mood as "Mood",
         logged_at as "Date",
-        recent_heart_rate as "Heart Rate",
+        mood as "Mood",
+        recent_heart_rate as "Heart Rate (bpm)",
         energy_burnt as "Energy Burnt (kcal)",
-        total_sleep as "Sleep (hours)",
-        time_in_daylight as "Time in Daylight (minutes)"
+        total_sleep as "Sleep Duration (hours)",
+        time_in_daylight as "Daylight Exposure (minutes)"
       FROM mental_health
-      ORDER BY logged_at DESC
-      LIMIT 30;
+      WHERE logged_at >= CURRENT_DATE - INTERVAL '30 days'
+      ORDER BY logged_at DESC;
     `;
 
     const result = await client.query(query);
     
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
-      return;
-    }
-
-    const parser = new Parser();
+    const fields = ['Date', 'Mood', 'Heart Rate (bpm)', 'Energy Burnt (kcal)', 'Sleep Duration (hours)', 'Daylight Exposure (minutes)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
@@ -1261,7 +1721,7 @@ app.get('/api/reports/mood/csv', async (req, res) => {
     res.send(csv);
   } catch (err) {
     console.error('Error generating mood report:', err);
-    res.status(500).json({ error: 'Failed to generate report' });
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
@@ -1273,23 +1733,27 @@ app.get('/api/reports/activity/csv', async (req, res) => {
   try {
     const query = `
       SELECT
-        hr.timestamp::date                        AS "Date",
-        ROUND(SUM(hr.value))::integer            AS "Active Energy (kcal)"
-      FROM health_realtime AS hr
-      WHERE hr.metric_name = 'active_energy'
-        AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
-      GROUP BY hr.timestamp::date
-      ORDER BY "Date";
+        DATE_TRUNC('day', timestamp)::date AS "Date",
+        ROUND(SUM(CASE WHEN metric_name = 'active_energy' THEN value ELSE 0 END)::numeric, 0) AS "Active Energy (kcal)",
+        ROUND(SUM(CASE WHEN metric_name = 'step_count' THEN value ELSE 0 END)::numeric, 0) AS "Steps",
+        ROUND(AVG(CASE WHEN metric_name = 'heart_rate' THEN value ELSE NULL END)::numeric, 1) AS "Average Heart Rate (bpm)"
+      FROM health_realtime
+      WHERE timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        AND metric_name IN ('active_energy', 'step_count', 'heart_rate')
+      GROUP BY DATE_TRUNC('day', timestamp)::date
+      ORDER BY "Date" DESC;
     `;
 
     const result = await client.query(query);
     
     if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
+      res.status(404).json({ error: 'No activity data found' });
       return;
     }
 
-    const parser = new Parser();
+    const fields = ['Date', 'Active Energy (kcal)', 'Steps', 'Average Heart Rate (bpm)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
@@ -1297,7 +1761,7 @@ app.get('/api/reports/activity/csv', async (req, res) => {
     res.send(csv);
   } catch (err) {
     console.error('Error generating activity report:', err);
-    res.status(500).json({ error: 'Failed to generate report' });
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
@@ -1309,28 +1773,27 @@ app.get('/api/reports/heart-rate/csv', async (req, res) => {
   try {
     const query = `
       SELECT
-        day as "Date",
-        avg_heart_rate as "Average Heart Rate (bpm)"
-      FROM (
-        SELECT
-          hr.timestamp::date                       AS day,
-          ROUND(AVG(hr.value)::numeric, 1)         AS avg_heart_rate
-        FROM health_realtime AS hr
-        WHERE hr.metric_name = 'heart_rate'
-          AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
-        GROUP BY hr.timestamp::date
-      ) AS sub
-      ORDER BY day;
+        DATE_TRUNC('day', timestamp)::date AS "Date",
+        ROUND(AVG(value)::numeric, 1) AS "Average Heart Rate (bpm)",
+        ROUND(MIN(value)::numeric, 1) AS "Minimum Heart Rate (bpm)",
+        ROUND(MAX(value)::numeric, 1) AS "Maximum Heart Rate (bpm)"
+      FROM health_realtime
+      WHERE metric_name = 'heart_rate'
+        AND timestamp >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY DATE_TRUNC('day', timestamp)::date
+      ORDER BY "Date" DESC;
     `;
 
     const result = await client.query(query);
     
     if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
+      res.status(404).json({ error: 'No heart rate data found' });
       return;
     }
 
-    const parser = new Parser();
+    const fields = ['Date', 'Average Heart Rate (bpm)', 'Minimum Heart Rate (bpm)', 'Maximum Heart Rate (bpm)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
@@ -1338,7 +1801,7 @@ app.get('/api/reports/heart-rate/csv', async (req, res) => {
     res.send(csv);
   } catch (err) {
     console.error('Error generating heart rate report:', err);
-    res.status(500).json({ error: 'Failed to generate report' });
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
@@ -1366,20 +1829,17 @@ app.get('/api/reports/exercise/csv', async (req, res) => {
 
     const result = await client.query(query);
     
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
-      return;
-    }
-
-    const parser = new Parser();
+    const fields = ['Date', 'Total Exercise (minutes)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename=exercise_report.csv');
     res.send(csv);
-  } catch (error) {
-    console.error('Error generating exercise report:', error);
-    res.status(500).json({ error: 'Failed to generate report' });
+  } catch (err) {
+    console.error('Error generating exercise report:', err);
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
@@ -1392,66 +1852,340 @@ app.get('/api/reports/headphone-exposure/csv', async (req, res) => {
     const query = `
       SELECT
         day as "Date",
-        avg_headphone_exposure as "Average Audio Exposure (dB)"
+        COALESCE(ROUND(avg_headphone_exposure::numeric, 1), 0) as "Average Audio Exposure (dB)"
       FROM (
         SELECT
-          hr.timestamp::date                     AS day,
-          ROUND(AVG(hr.value)::numeric, 1)         AS avg_headphone_exposure
-        FROM health_aggregated  AS hr
-        WHERE hr.metric_name = 'headphone_audio_exposure'
-          AND hr.timestamp >= CURRENT_DATE - INTERVAL '30 days'
-        GROUP BY hr.timestamp::date
+          timestamp::date AS day,
+          AVG(value) as avg_headphone_exposure
+        FROM health_aggregated
+        WHERE metric_name = 'audio_exposure'
+          AND timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY timestamp::date
       ) AS sub
-      ORDER BY day;
+      ORDER BY day DESC;
     `;
 
     const result = await client.query(query);
     
     if (result.rows.length === 0) {
-      res.status(404).json({ error: 'No data found' });
-      return;
+      // Return at least one row with zero values if no data
+      result.rows = [{
+        "Date": new Date().toISOString().split('T')[0],
+        "Average Audio Exposure (dB)": 0
+      }];
     }
-
-    const parser = new Parser();
+    
+    const fields = ['Date', 'Average Audio Exposure (dB)'];
+    const opts = { fields };
+    const parser = new Parser(opts);
     const csv = parser.parse(result.rows);
     
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename=headphone_exposure_report.csv');
     res.send(csv);
-  } catch (error) {
-    console.error('Error generating headphone exposure report:', error);
-    res.status(500).json({ error: 'Failed to generate report' });
+  } catch (err) {
+    console.error('Error generating headphone exposure report:', err);
+    res.status(500).json({ error: 'Failed to generate report', details: err.message });
   } finally {
     client.release();
   }
 });
 
-// Email reports endpoint
-app.post('/api/reports/email', upload.array('reports'), async (req, res) => {
+// Add this new endpoint to inspect the mental_health table
+app.get('/api/debug/mental-health', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { email } = req.body;
-    const attachments = req.files.map(file => ({
-      filename: file.originalname,
-      content: file.buffer
-    }));
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: 'Health Reports',
-      text: 'Please find attached your health reports.',
-      attachments
-    };
-
-    await transporter.sendMail(mailOptions);
-    res.json({ message: 'Reports sent successfully' });
-  } catch (error) {
-    console.error('Error sending email:', error);
-    res.status(500).json({ error: 'Failed to send email' });
+    // Get table structure
+    const structureQuery = `
+      SELECT column_name, data_type 
+      FROM information_schema.columns 
+      WHERE table_name = 'mental_health';
+    `;
+    
+    // Get all records
+    const dataQuery = `
+      SELECT * 
+      FROM mental_health 
+      ORDER BY logged_at DESC 
+      LIMIT 10;
+    `;
+    
+    const structure = await client.query(structureQuery);
+    const data = await client.query(dataQuery);
+    
+    res.json({
+      structure: structure.rows,
+      data: data.rows
+    });
+  } catch (err) {
+    console.error('Error fetching mental health data:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
+// Add the chat endpoint
+app.post('/api/chat', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { messages, message, mode = "chat" } = req.body; // Add mode parameter with default "chat"
+    
+    // Fetch current health stats
+    const healthStats = await client.query(queries.getCurrentHealthStats);
+    const healthData = healthStats.rows[0].health_report;
+    
+    const systemPrompt = `You are Shovan's personal AI health companion (22 years old, male, 60 kg)—part data analyst, part best friend—always warm, empathetic, and insightful.
+
+
+General formatting rules (both modes):
+  • **Emphasize key insights** by bolding them (e.g. **heart rate spike**, **sleep drop**).  
+  • Break replies into short, clear paragraphs with line-breaks.  
+  • Highlight specific values or percentages in \`inline code\`.  
+  • Keep the tone casual—no "Hey Shovan" every time, just friendly chat.  
+  • Pull fresh stats each time; don't recycle the same numbers.
+  
+Additional per-mode rules:
+
+
+When Shovan writes something like "hmm sounds good, will let you know," or any non-health prompt in notification mode,  reply:just
+> "Sure, I'm here whenever you need me."
+
+When he indicates he's not feeling well or wants to chat ("I'm feeling low today"), automatically switch to **mode: "chat"** and give the full analysis.`;
+
+    // Simplified context with only relevant metrics
+    const latestContext = `
+Mode: ${mode}
+
+Health Stats:
+HR: ${healthData.current_heart_rate}/${healthData.avg_heart_rate_today}bpm
+RespRate: ${healthData.current_respiratory_rate}/${healthData.avg_respiratory_rate_today}
+Sleep: ${healthData.total_sleep_last}h (Deep:${healthData.deep_sleep_last}h)
+Exercise: ${healthData.exercise_time_today}min
+Mood: ${healthData.latest_mood}`;
+
+    // Keep only last 5 messages to reduce context
+    const recentMessages = messages ? messages.slice(-5) : [];
+
+    const conversationMessages = [
+      { role: "system", content: systemPrompt },
+      ...recentMessages,
+      { 
+        role: "user", 
+        content: `${latestContext}\n\n${message}`
+      }
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: conversationMessages,
+      temperature: 0.7,
+      max_tokens: 500  // Reduced from 1000
+    });
+
+    const aiResponse = completion.choices[0].message.content;
+    
+    res.json({ 
+      response: aiResponse,
+      healthStats: healthData
+    });
+  } catch (err) {
+    console.error('Error in chat endpoint:', err);
+    res.status(500).json({ 
+      error: 'Failed to process chat request', 
+      details: err.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
 // Start the server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Add this endpoint to your existing server.js
+app.get('/api/health-data', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT json_build_object(
+        'sleep_analysis', (
+          SELECT COALESCE(json_agg(row_to_json(sa)), '[]')
+          FROM sleep_analysis sa
+          WHERE sa.record_date = CURRENT_DATE
+        ),
+        'health_aggregated', (
+          SELECT COALESCE(json_agg(row_to_json(ha)), '[]')
+          FROM health_aggregated ha
+          WHERE ha.timestamp >= NOW() - INTERVAL '1 hour'
+        ),
+        'health_realtime', (
+          SELECT COALESCE(json_agg(row_to_json(hr)), '[]')
+          FROM health_realtime hr
+          WHERE hr.timestamp >= NOW() - INTERVAL '1 hour'
+        ),
+        'mental_health', (
+          SELECT COALESCE(json_agg(row_to_json(mh)), '[]')
+          FROM mental_health mh
+          WHERE mh.logged_at >= NOW() - INTERVAL '1 hour'
+        )
+      ) AS all_data`;
+
+    const result = await client.query(query);
+    const data = result.rows[0].all_data;
+
+    const summary = {
+      sleep_analysis_count: data.sleep_analysis.length,
+      health_aggregated_count: data.health_aggregated.length,
+      health_realtime_count: data.health_realtime.length,
+      mental_health_count: data.mental_health.length
+    };
+
+    res.json({
+      summary,
+      data
+    });
+
+  } catch (error) {
+    console.error('Error fetching data:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch health data',
+      details: error.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Add notifications endpoint
+app.post('/api/notifications', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { content } = req.body;
+    
+    const query = `
+      INSERT INTO notifications (content)
+      VALUES ($1)
+      RETURNING id, content, received_at
+    `;
+    
+    const result = await client.query(query, [content]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving notification:', err);
+    res.status(500).json({ error: 'Failed to save notification' });
+  } finally {
+    client.release();
+  }
+});
+
+// Add endpoint to fetch notifications
+app.get('/api/notifications', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT id, content, received_at
+      FROM notifications
+      ORDER BY received_at DESC
+      LIMIT 50
+    `;
+    
+    const result = await client.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching notifications:', err);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  } finally {
+    client.release();
+  }
+});
+
+// Add notifications analysis endpoint
+app.post('/api/analyze-health', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    // Fetch current health stats
+    const healthStats = await client.query(queries.getCurrentHealthStats);
+    const healthData = healthStats.rows[0].health_report;
+    
+    const systemPrompt = `You are PulseX AI AI health analyzer focused on detecting concerning patterns or anomalies in health data from the last hour.
+
+  General formatting rules ():
+  • **Emphasize key insights** by bolding them (e.g. **heart rate spike**, **sleep drop**).  
+  • Break replies into short, clear paragraphs with line-breaks.  
+  • Highlight specific values or percentages in \`inline code\`.  
+  • Keep the tone casual—no "Hey Shovan" every time, just friendly chat.  
+  • Pull fresh stats each time; don't recycle the same numbers.
+
+Your role is to:
+• Generate short, punchy alerts (1-2 sentences max)
+• Only highlight significant anomalies or concerning patterns
+• Be direct and clear - no small talk or lengthy explanations
+• If nothing is concerning, respond with exactly: "No immediate concerns."
+
+Example outputs:
+“Elevated heart rate detected—82 bpm is 15% above your baseline.”
+
+“Sleep quality drop—only 5.2 hrs with minimal deep sleep.”
+
+“No immediate concerns.”
+do not use * for formatting or bold`;
+
+    const healthContext = `
+Last Hour's Health Data:
+- Current Heart Rate: ${healthData.current_heart_rate} bpm (Today's avg: ${healthData.avg_heart_rate_today} bpm)
+- Current Respiratory Rate: ${healthData.current_respiratory_rate} (Today's avg: ${healthData.avg_respiratory_rate_today})
+- HRV: ${healthData.current_hr_variability} ms (10-day avg: ${healthData.avg_hr_variability_10d} ms)
+- Last Sleep: ${healthData.total_sleep_last}h (Deep: ${healthData.deep_sleep_last}h)
+- Exercise Today: ${healthData.exercise_time_today} minutes
+- Current Mood: ${healthData.latest_mood}
+
+Please analyze this data and highlight any concerning patterns or anomalies from the last hour.`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: healthContext }
+      ],
+      temperature: 0.5,  // Lower temperature for more consistent, focused responses
+      max_tokens: 100    // Limit response length
+    });
+
+    const analysisResult = completion.choices[0].message.content.trim();
+    
+    // Only save notification if there are concerns
+    if (!analysisResult.includes("No immediate concerns")) {
+      const saveQuery = `
+        INSERT INTO notifications (content)
+        VALUES ($1)
+        RETURNING id, content, received_at
+      `;
+      
+      const result = await client.query(saveQuery, [analysisResult]);
+      
+      res.json({ 
+        notification: result.rows[0],
+        healthStats: healthData
+      });
+    } else {
+      res.json({ 
+        notification: null,
+        message: "No immediate concerns",
+        healthStats: healthData
+      });
+    }
+    
+  } catch (err) {
+    console.error('Error analyzing health data:', err);
+    res.status(500).json({ 
+      error: 'Failed to analyze health data', 
+      details: err.message 
+    });
+  } finally {
+    client.release();
+  }
 });

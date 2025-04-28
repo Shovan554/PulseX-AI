@@ -3,7 +3,10 @@
 **PulseX** is a smart personal health assistant that ingests your smartwatch data, applies advanced analytics, and delivers in-depth, doctor-quality insights in real time. This project is currently under development and not hosted in production.
 
 ---
-<div align="center" style="display: flex; overflow-x: auto; gap: 10px; padding: 16px 0;">
+<details>
+  <summary>▶️ Click to view screenshots</summary>
+
+  <div align="center" style="display: flex; overflow-x: auto; gap: 10px; padding: 16px 0;">
     <img src="demo.png"   alt="Dashboard"  width="300" />
     <img src="trends.png" alt="Trends"     width="300" />
     <img src="sleep.png"  alt="Sleep Data" width="300" />
@@ -12,7 +15,7 @@
     <img src="stress.png" alt="Stress"     width="300" />
   </div>
 
-
+</details>
 ## Features
 
 - **Real-time monitoring** of vitals: heart rate, step count, active energy, respiratory rate, sleep stages, and body temperature.  

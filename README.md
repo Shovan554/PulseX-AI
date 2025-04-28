@@ -10,13 +10,13 @@
 </details>
 
 <details>
-  <summary>▶️ Trends</summary>
+  <summary>▶️ Trends Page</summary>
   
   ![Trends](trends.png)
 </details>
 
 <details>
-  <summary>▶️ Sleep Data</summary>
+  <summary>▶️ Sleep Analytics page</summary>
   
   ![Sleep](sleep.png)
 </details>
@@ -28,13 +28,13 @@
 </details>
 
 <details>
-  <summary>▶️ Reports</summary>
+  <summary>▶️ Reports Page</summary>
   
   ![Reports](reports.png)
 </details>
 
 <details>
-  <summary>▶️ Stress</summary>
+  <summary>▶️ Mood log Page</summary>
   
   ![Stress](stress.png)
 </details>

@@ -4,18 +4,41 @@
 
 ---
 <details>
-  <summary>▶️ Click to view screenshots</summary>
-
-  <div align="center" style="display: flex; overflow-x: auto; gap: 10px; padding: 16px 0;">
-    <img src="demo.png"   alt="Dashboard"  width="300" />
-    <img src="trends.png" alt="Trends"     width="300" />
-    <img src="sleep.png"  alt="Sleep Data" width="300" />
-    <img src="ai.png"     alt="AI Chatbot" width="300" />
-    <img src="reports.png"alt="Reports"    width="300" />
-    <img src="stress.png" alt="Stress"     width="300" />
-  </div>
-
+  <summary>▶️ Dashboard</summary>
+  
+  ![Dashboard](demo.png)
 </details>
+
+<details>
+  <summary>▶️ Trends</summary>
+  
+  ![Trends](trends.png)
+</details>
+
+<details>
+  <summary>▶️ Sleep Data</summary>
+  
+  ![Sleep](sleep.png)
+</details>
+
+<details>
+  <summary>▶️ AI Chatbot</summary>
+  
+  ![AI Chatbot](ai.png)
+</details>
+
+<details>
+  <summary>▶️ Reports</summary>
+  
+  ![Reports](reports.png)
+</details>
+
+<details>
+  <summary>▶️ Stress</summary>
+  
+  ![Stress](stress.png)
+</details>
+
 ## Features
 
 - **Real-time monitoring** of vitals: heart rate, step count, active energy, respiratory rate, sleep stages, and body temperature.  

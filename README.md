@@ -3,6 +3,7 @@
 **PulseX** is a smart personal health assistant that ingests your smartwatch data, applies advanced analytics, and delivers in-depth, doctor-quality insights in real time. This project is currently under development and not hosted in production.
 
 ---
+![PulseX App](demo.png)
 
 ## Features
 
@@ -35,6 +36,7 @@ HealthAI uses the following APIs and services:
    ```bash
     npm install
 
+![Architechture](architechture.png)
 
 **## Usage
 
@@ -47,8 +49,7 @@ HealthAI uses the following APIs and services:
 
 ## Roadmap
 
-- 🌐 **Web dashboard**: interactive charts and drill-down views.  
-- 📱 **Mobile companion app**: real-time notifications and quick glances.  
+- 🌐 **Web dashboard**: interactive charts and drill-down views.   
 - 🔔 **Push notifications**: for critical alerts on anomalies.  
 - 🔒 **Privacy controls**: user data encryption and fine-grained permissions.
 
